@@ -6,8 +6,29 @@
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "cross-env ELECTRON_RUN_AS_NODE= vite",
-    "build": "tsc && vite build",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "package": "npm run build && electron-builder --win",
     "preview": "vite preview"
+  },
+  "build": {
+    "appId": "com.image-metadata-viewer",
+    "productName": "Image Metadata Viewer",
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ]
   },
   "dependencies": {
     "exifr": "^7.1.3",

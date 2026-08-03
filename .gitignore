@@ -1,6 +1,7 @@
 node_modules/
 dist/
 dist-electron/
+release/
 *.js.map
 .DS_Store
 # tsc 编译产物

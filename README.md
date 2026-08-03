@@ -11,15 +11,12 @@
 - **AI 生成信息解析**：自动识别 ComfyUI、Stable Diffusion WebUI 等工具生成的图片，结构化展示提示词、参数、模型、LoRA
 - 导出为 JSON / CSV / TXT / HTML / PDF
 
-## 运行
+## 脚本
 
 ```bash
-npm install
-npm run dev
-```
-
-## 构建
-
-```bash
-npm run build
+npm install         # 安装依赖
+npm run dev         # 启动开发模式（Electron + Vite HMR）
+npm run build       # 构建生产版本 → dist/ + dist-electron/
+npm run typecheck   # TypeScript 类型检查（不生成文件）
+npm run package     # 构建 + 打包为 Windows 安装程序 → release/
 ```
