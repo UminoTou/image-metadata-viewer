@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-electron/
+*.js.map
+.DS_Store
+# tsc 编译产物
+electron/*.js
+src/*.js
+src/**/*.js
