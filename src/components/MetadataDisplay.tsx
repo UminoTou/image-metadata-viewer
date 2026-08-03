@@ -15,15 +15,15 @@ function MetadataDisplay({ metadata }: MetadataDisplayProps): JSX.Element {
     <div className="metadata-display">
       <h2 className="section-title">📋 元数据信息</h2>
 
+      {metadata.ai && (
+        <AiGenerationSection ai={metadata.ai} />
+      )}
+
       <FileInfoSection file={metadata.file} />
       <ImageInfoSection image={metadata.image} />
 
       {metadata.png_chunks && (
         <PngChunksSection chunks={metadata.png_chunks} />
-      )}
-
-      {metadata.ai && (
-        <AiGenerationSection ai={metadata.ai} />
       )}
 
       {metadata.exif && metadata.exif.length > 0 && (

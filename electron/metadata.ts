@@ -213,8 +213,6 @@ function parseAiMetadata(chunks: PngChunkData | null, exif: ExifEntry[] | null):
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function parseComfyUIPrompt(prompt: Record<string, any>): AiGenerationInfo {
-  let positive: string | null = null
-  let negative: string | null = null
   let seed: number | null = null
   let steps: number | null = null
   let cfg: number | null = null
@@ -229,16 +227,20 @@ function parseComfyUIPrompt(prompt: Record<string, any>): AiGenerationInfo {
   let batchSize: number | null = null
   const loras: LoraInfo[] = []
   const modelNames: string[] = []
+  const positiveParts: string[] = []
+  const negativeParts: string[] = []
+
+  // Known negative prompt patterns (used when field name is ambiguous like "positive")
+  const negativePattern = /^(worst quality|low quality|bad quality|bad anatomy|blurry|jpeg artifacts|lowres|malformed|mutated|poorly drawn|bad hands|missing fingers|extra fingers|fused fingers|too many fingers|deformed|disfigured|ugly|error|watermark|signature|username|artist name|censor)/i
 
   for (const node of Object.values(prompt)) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const n = node as any
-    const ct: string = n.class_type ?? ''
+    const inp: Record<string, any> = n.inputs ?? {}
 
-    // KSampler → seed, steps, cfg, sampler, scheduler, denoise
-    if (ct === 'KSampler' || ct === 'KSamplerAdvanced') {
-      const inp = n.inputs ?? {}
-      if (inp.seed !== undefined) seed = Number(inp.seed)
+    // ── Sampler: any node with seed + (steps or cfg) ──
+    if (!seed && inp.seed !== undefined && (inp.steps !== undefined || inp.cfg !== undefined)) {
+      seed = Number(inp.seed)
       if (inp.steps !== undefined) steps = Number(inp.steps)
       if (inp.cfg !== undefined) cfg = Number(inp.cfg)
       if (inp.sampler_name) sampler = String(inp.sampler_name)
@@ -246,71 +248,66 @@ function parseComfyUIPrompt(prompt: Record<string, any>): AiGenerationInfo {
       if (inp.denoise !== undefined) denoise = Number(inp.denoise)
     }
 
-    // EmptyLatentImage → width, height, batch_size
-    if (ct === 'EmptyLatentImage') {
-      const inp = n.inputs ?? {}
-      if (inp.width !== undefined) width = Number(inp.width)
-      if (inp.height !== undefined) height = Number(inp.height)
+    // ── Size: any node with width + height ──
+    if (!width && !height && inp.width !== undefined && inp.height !== undefined) {
+      width = Number(inp.width)
+      height = Number(inp.height)
       if (inp.batch_size !== undefined) batchSize = Number(inp.batch_size)
     }
 
-    // Any node with a "text" input → prompt content
-    const inp = n.inputs ?? {}
-    if (typeof inp.text === 'string' && inp.text.trim()) {
-      const text = inp.text.trim()
-      const title = n._meta?.title ?? ''
-      // Heuristic: node with "负面" or "negative" in title = negative prompt
-      // node with "正面" or "positive" in title = positive prompt
-      if (title.includes('负面') || title.includes('negative') || title.includes('Negative')) {
-        if (text !== negative) negative = text
-      } else {
-        if (text !== positive) positive = text
+    // ── Prompt: check text / positive / negative / prompt fields ──
+    for (const field of ['text', 'positive', 'negative', 'prompt']) {
+      if (typeof inp[field] === 'string' && inp[field].trim()) {
+        const content = inp[field].trim()
+        // Field named "negative" is always negative; content matching
+        // negative keywords is negative regardless of field name
+        if (field === 'negative' || negativePattern.test(content)) {
+          negativeParts.push(content)
+        } else {
+          positiveParts.push(content)
+        }
       }
     }
 
-    // CheckpointLoaderSimple / UNETLoader → model name
-    if (ct === 'CheckpointLoaderSimple') {
-      const name = n.inputs?.ckpt_name
-      if (name) modelNames.push(String(name))
-    }
-    if (ct === 'UNETLoader') {
-      const name = n.inputs?.unet_name
-      if (name) modelNames.push(String(name))
-    }
+    // ── Model: any *_name field containing .safetensors / .ckpt / .pt ──
+    for (const [key, value] of Object.entries(inp)) {
+      if (typeof value !== 'string') continue
+      if (!/\.(safetensors|ckpt|pt|pth|onnx|bin)$/i.test(value)) continue
 
-    // VAELoader → VAE name
-    if (ct === 'VAELoader') {
-      const name = n.inputs?.vae_name
-      if (name) vaeName = String(name)
-    }
-
-    // CLIPLoader → CLIP name
-    if (ct === 'CLIPLoader') {
-      const name = n.inputs?.clip_name
-      if (name) clipName = String(name)
-    }
-
-    // DualCLIPLoader → CLIP names
-    if (ct === 'DualCLIPLoader') {
-      const c1 = n.inputs?.clip_name1
-      const c2 = n.inputs?.clip_name2
-      const parts: string[] = []
-      if (c1) parts.push(String(c1))
-      if (c2) parts.push(String(c2))
-      if (parts.length > 0) clipName = parts.join(' + ')
-    }
-
-    // LoraLoader / LoraLoaderModelOnly → LoRA
-    if (ct === 'LoraLoader' || ct === 'LoraLoaderModelOnly') {
-      const name = n.inputs?.lora_name
-      if (name) {
-        loras.push({
-          name: String(name),
-          strength: n.inputs?.strength_model ?? n.inputs?.strength_clip ?? null
-        })
+      if (key === 'vae_name') {
+        vaeName = vaeName || value
+      } else if (key.startsWith('clip_name')) {
+        clipName = clipName ? clipName + ' + ' + value : value
+      } else if (key === 'lora_name') {
+        loras.push({ name: value, strength: inp.strength_model ?? inp.strength_clip ?? inp.strength ?? null })
+      } else if (!key.includes('lora') && !key.includes('vae') && !key.includes('clip')) {
+        modelNames.push(value)
       }
+    }
+
+    // ── LoRA JSON string ──
+    if (typeof inp.lora_str === 'string') {
+      try {
+        const loraArr = JSON.parse(inp.lora_str)
+        if (Array.isArray(loraArr)) {
+          for (const l of loraArr) {
+            if (l.name || l.lora) {
+              loras.push({
+                name: String(l.display_name || l.name || l.lora),
+                strength: l.weight ?? l.strength ?? null
+              })
+            }
+          }
+        }
+      } catch { /* not JSON, ignore */ }
     }
   }
+
+  // Merge prompts
+  let positive: string | null = null
+  let negative: string | null = null
+  if (positiveParts.length > 0) positive = positiveParts.join(', ').replace(/,\s*,/g, ',')
+  if (negativeParts.length > 0) negative = negativeParts.join(', ').replace(/,\s*,/g, ',')
 
   modelName = modelNames.length > 0 ? modelNames.join(' + ') : null
 
