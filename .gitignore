@@ -4,7 +4,14 @@ dist-electron/
 release/
 *.js.map
 .DS_Store
+
 # tsc 编译产物
+# root cause：tsconfig.json 没开 noEmit，跑一次裸 tsc 就会把 .js 吐在源码旁边，
+# 而 Vite 默认把 .js 排在 .ts/.tsx 之前，会顶掉真正的源码（详见 vite.config.ts 注释）
 electron/*.js
-src/*.js
 src/**/*.js
+*.tsbuildinfo
+
+# 编辑器 / Agent 本地状态
+.claude/
+.workbuddy/

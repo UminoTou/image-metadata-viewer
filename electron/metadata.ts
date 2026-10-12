@@ -3,6 +3,7 @@ import { createHash } from 'crypto'
 import { basename } from 'path'
 import { imageSize } from 'image-size'
 import exifr from 'exifr'
+import { parseLooseJson, isLooseJson } from '../src/utils/loose-json'
 import type { ImageMetadata, FileInfo, ImageInfo, PngChunkData, TextChunk, ZtxtChunk, ITextChunk, ExifEntry, AiGenerationInfo, LoraInfo } from '../src/types/metadata'
 
 function formatFileSize(bytes: number): string {
@@ -178,14 +179,15 @@ function parseAiMetadata(chunks: PngChunkData | null, exif: ExifEntry[] | null):
     ]
 
     // ComfyUI: prompt chunk is API-format JSON
+    // ⚠️ ComfyUI 的 prompt 块由 Python 序列化，NaN / Infinity 会以裸字面量出现在 JSON 里，
+    // 严格 JSON.parse 会直接抛错（本仓库实测：`"is_changed": [NaN]`），
+    // 必须用宽松解析，否则整块 AI 生成信息都读不出来
     const promptChunk = allTextChunks.find(c => c.keyword === 'prompt')
     if (promptChunk) {
-      try {
-        const parsed = JSON.parse(promptChunk.text)
-        if (typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return parseComfyUIPrompt(parsed)
-        }
-      } catch { /* not valid JSON, fall through */ }
+      const parsed = parseLooseJson<unknown>(promptChunk.text)
+      if (isRecord(parsed)) {
+        return parseComfyUIPrompt(parsed as ComfyPromptGraph)
+      }
     }
 
     // A1111 / SD-WebUI: parameters chunk
@@ -211,8 +213,128 @@ function parseAiMetadata(chunks: PngChunkData | null, exif: ExifEntry[] | null):
   return null
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function parseComfyUIPrompt(prompt: Record<string, any>): AiGenerationInfo {
+// ── ComfyUI 图结构工具 ──
+
+interface ComfyNodeLike {
+  class_type?: string
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  inputs?: Record<string, any>
+}
+
+type ComfyPromptGraph = Record<string, ComfyNodeLike>
+
+/** 连线引用形如 ["45", 1]：源节点 id + 输出槽位序号 */
+function isNodeLink(value: unknown): value is [string | number, number] {
+  return (
+    Array.isArray(value) &&
+    value.length === 2 &&
+    (typeof value[0] === 'string' || typeof value[0] === 'number') &&
+    typeof value[1] === 'number'
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * 严格取数：连线数组、对象、空串一律返回 null。
+ * 之前直接 Number(inp.width) 会拿到 Number(['96', 0]) === NaN，
+ * 于是「尺寸」显示成 NaN × NaN。
+ * @param value 待转换的值
+ * @returns 有限数字；无法转换时为 null
+ */
+function toNumber(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+// `<lora:名称:权重>` 或 `<lora:名称:权重:clip权重>`（LoraManager / A1111 通用写法）
+const LORA_TAG_PATTERN = /<lora:([^:>]+):(-?\d*\.?\d+)(?::(-?\d*\.?\d+))?>/gi
+
+/** 抽出文本里所有 <lora:...> 标签 */
+function extractLoraTags(text: string): LoraInfo[] {
+  const found: LoraInfo[] = []
+  for (const match of text.matchAll(LORA_TAG_PATTERN)) {
+    found.push({ name: match[1], strength: toNumber(match[2]) })
+  }
+  return found
+}
+
+/** 去掉 LoRA 标签，只留正文 */
+function stripLoraTags(text: string): string {
+  return text.replace(LORA_TAG_PATTERN, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** 该字段是否只是「LoRA 标签容器」而非提示词正文（LoraManager 的 text 字段就是这种） */
+function isLoraTagContainer(text: string): boolean {
+  if (!text.includes('<lora:')) return false
+  return stripLoraTags(text).length === 0
+}
+
+/** 正向 / 反向分支上承载提示词的字段优先级 */
+const POSITIVE_FIELDS = ['positive', 'positive_prompt', 'text', 'prompt']
+const NEGATIVE_FIELDS = ['negative', 'negative_prompt', 'text', 'prompt']
+/** 兜底扫描时认的字段名（图里没连出提示词才会用到） */
+const PROMPT_TEXT_FIELDS = ['text', 'positive', 'negative', 'prompt', 'positive_prompt', 'negative_prompt']
+
+/**
+ * 沿连线回溯，找到真正写着提示词的节点。
+ * 采样器的 positive / negative 常先连到零化、拼接之类的中间节点，
+ * 只看采样器自己那一层是拿不到文本的（这正是之前把 LoRA 标签当成正向提示词的原因：
+ * 旧实现改成「哪个节点有 text 字段就用谁」，于是 LoraManager 的 text 被误收）。
+ * @param nodes 节点表
+ * @param ref 连线引用 [节点id, 槽位]
+ * @param branch 处于正向还是反向分支
+ * @param visited 已访问节点，防止成环
+ * @param depth 递归深度上限
+ * @returns 找到的提示词文本数组
+ */
+function resolvePromptText(
+  nodes: ComfyPromptGraph,
+  ref: unknown,
+  branch: 'positive' | 'negative',
+  visited: Set<string> = new Set(),
+  depth = 0
+): string[] {
+  if (!isNodeLink(ref) || depth > 8) return []
+
+  const nodeId = String(ref[0])
+  if (visited.has(nodeId)) return []
+  visited.add(nodeId)
+
+  const node = nodes[nodeId]
+  if (!node) return []
+
+  const classType = node.class_type ?? ''
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const inp: Record<string, any> = node.inputs ?? {}
+
+  // 条件零化：文本在这里被丢弃，等价于「没有提示词」，继续上溯反而会找错
+  if (/zero.?out/i.test(classType)) return []
+
+  const fields = branch === 'positive' ? POSITIVE_FIELDS : NEGATIVE_FIELDS
+  for (const field of fields) {
+    const value = inp[field]
+    if (typeof value === 'string' && value.trim() && !isLoraTagContainer(value)) {
+      return [value.trim()]
+    }
+  }
+
+  // 当前节点不是文本节点，继续沿条件输入往上找
+  for (const field of ['conditioning', 'positive', 'negative', 'text', 'prompt']) {
+    const found = resolvePromptText(nodes, inp[field], branch, visited, depth + 1)
+    if (found.length > 0) return found
+  }
+
+  return []
+}
+
+function parseComfyUIPrompt(prompt: ComfyPromptGraph): AiGenerationInfo {
   let seed: number | null = null
   let steps: number | null = null
   let cfg: number | null = null
@@ -225,6 +347,9 @@ function parseComfyUIPrompt(prompt: Record<string, any>): AiGenerationInfo {
   let clipName: string | null = null
   let denoise: number | null = null
   let batchSize: number | null = null
+  let samplerSeen = false
+  let positiveFromGraph: string[] = []
+  let negativeFromGraph: string[] = []
   const loras: LoraInfo[] = []
   const modelNames: string[] = []
   const positiveParts: string[] = []
@@ -239,31 +364,77 @@ function parseComfyUIPrompt(prompt: Record<string, any>): AiGenerationInfo {
     const inp: Record<string, any> = n.inputs ?? {}
 
     // ── Sampler: any node with seed + (steps or cfg) ──
-    if (!seed && inp.seed !== undefined && (inp.steps !== undefined || inp.cfg !== undefined)) {
-      seed = Number(inp.seed)
-      if (inp.steps !== undefined) steps = Number(inp.steps)
-      if (inp.cfg !== undefined) cfg = Number(inp.cfg)
-      if (inp.sampler_name) sampler = String(inp.sampler_name)
-      if (inp.scheduler) scheduler = String(inp.scheduler)
-      if (inp.denoise !== undefined) denoise = Number(inp.denoise)
+    const hasSeed = inp.seed !== undefined || inp.noise_seed !== undefined
+    const hasSampling = inp.steps !== undefined || inp.step !== undefined ||
+      inp.cfg !== undefined || inp.cfg_scale !== undefined
+    if (!samplerSeen && hasSeed && hasSampling) {
+      samplerSeen = true
+      seed = toNumber(inp.seed ?? inp.noise_seed)
+      steps = toNumber(inp.steps ?? inp.step)
+      cfg = toNumber(inp.cfg ?? inp.cfg_scale)
+      denoise = toNumber(inp.denoise)
+      if (inp.sampler_name !== undefined || inp.sampler !== undefined) {
+        sampler = String(inp.sampler_name ?? inp.sampler)
+      }
+      if (inp.scheduler !== undefined) scheduler = String(inp.scheduler)
     }
 
-    // ── Size: any node with width + height ──
-    if (!width && !height && inp.width !== undefined && inp.height !== undefined) {
-      width = Number(inp.width)
-      height = Number(inp.height)
-      if (inp.batch_size !== undefined) batchSize = Number(inp.batch_size)
+    // ── 顺着 positive / negative 连线回溯真正的提示词节点 ──
+    if (positiveFromGraph.length === 0) {
+      positiveFromGraph = resolvePromptText(prompt, inp.positive ?? inp.positive_conditioning, 'positive')
+    }
+    if (negativeFromGraph.length === 0) {
+      negativeFromGraph = resolvePromptText(prompt, inp.negative ?? inp.negative_conditioning, 'negative')
     }
 
-    // ── Prompt: check text / positive / negative / prompt fields ──
-    for (const field of ['text', 'positive', 'negative', 'prompt']) {
-      if (typeof inp[field] === 'string' && inp[field].trim()) {
+    // ── Size ──
+    if (width === null && height === null) {
+      const literalWidth = toNumber(inp.width)
+      const literalHeight = toNumber(inp.height)
+      if (literalWidth !== null && literalHeight !== null) {
+        width = literalWidth
+        height = literalHeight
+        batchSize = toNumber(inp.batch_size) ?? batchSize
+      }
+    }
+
+    // 批次数：可能挂在 EmptyLatentImage，也可能挂在采样器，单独取
+    if (batchSize === null) {
+      batchSize = toNumber(inp.batch_size)
+    }
+
+    // EmptyLatentImage 的宽高常是连线（读出来是数组），
+    // 真实数值可能落在 ResolutionPreset 节点的 resolution_json 里
+    if (width === null && typeof inp.resolution_json === 'string') {
+      const preset = parseLooseJson<Record<string, unknown>>(inp.resolution_json)
+      const presetWidth = toNumber(preset?.width)
+      const presetHeight = toNumber(preset?.height)
+      if (presetWidth !== null && presetHeight !== null) {
+        width = presetWidth
+        height = presetHeight
+      }
+    }
+    if (width === null && typeof inp.resolution === 'string') {
+      const sizeMatch = inp.resolution.match(/(\d+)\s*[x×]\s*(\d+)/i)
+      if (sizeMatch) {
+        width = Number(sizeMatch[1])
+        height = Number(sizeMatch[2])
+      }
+    }
+
+    // ── Prompt: 只有连线回溯没拿到文本时，才走「按字段名猜」的兜底 ──
+    if (positiveFromGraph.length === 0 || negativeFromGraph.length === 0) {
+      for (const field of PROMPT_TEXT_FIELDS) {
+        if (typeof inp[field] !== 'string' || !inp[field].trim()) continue
         const content = inp[field].trim()
+        // LoRA 标签容器（如 LoraManager 的 text 字段）不是提示词
+        if (isLoraTagContainer(content)) continue
         // Field named "negative" is always negative; content matching
         // negative keywords is negative regardless of field name
-        if (field === 'negative' || negativePattern.test(content)) {
-          negativeParts.push(content)
-        } else {
+        const isNegativeField = field === 'negative' || field === 'negative_prompt'
+        if (isNegativeField || negativePattern.test(content)) {
+          if (negativeFromGraph.length === 0) negativeParts.push(content)
+        } else if (positiveFromGraph.length === 0) {
           positiveParts.push(content)
         }
       }
@@ -279,37 +450,62 @@ function parseComfyUIPrompt(prompt: Record<string, any>): AiGenerationInfo {
       } else if (key.startsWith('clip_name')) {
         clipName = clipName ? clipName + ' + ' + value : value
       } else if (key === 'lora_name') {
-        loras.push({ name: value, strength: inp.strength_model ?? inp.strength_clip ?? inp.strength ?? null })
+        loras.push({ name: value, strength: toNumber(inp.strength_model ?? inp.strength_clip ?? inp.strength) })
       } else if (!key.includes('lora') && !key.includes('vae') && !key.includes('clip')) {
         modelNames.push(value)
       }
     }
 
-    // ── LoRA JSON string ──
+    // ── LoraManager：结构化 loras 字段 { __value__: [{ name, strength, active }] } ──
+    const loraField = inp.loras
+    const loraList = isRecord(loraField) ? loraField.__value__ : loraField
+    if (Array.isArray(loraList)) {
+      for (const item of loraList) {
+        if (!isRecord(item)) continue
+        const name = item.display_name ?? item.name ?? item.lora
+        if (typeof name !== 'string' || !name.trim()) continue
+        loras.push({ name: name.trim(), strength: toNumber(item.strength ?? item.weight) })
+      }
+    }
+
+    // ── LoRA JSON string（被序列化成字符串的 LoRA 数组）──
     if (typeof inp.lora_str === 'string') {
-      try {
-        const loraArr = JSON.parse(inp.lora_str)
-        if (Array.isArray(loraArr)) {
-          for (const l of loraArr) {
-            if (l.name || l.lora) {
-              loras.push({
-                name: String(l.display_name || l.name || l.lora),
-                strength: l.weight ?? l.strength ?? null
-              })
-            }
-          }
+      const loraArr = parseLooseJson<unknown>(inp.lora_str)
+      if (Array.isArray(loraArr)) {
+        for (const item of loraArr) {
+          if (!isRecord(item)) continue
+          const name = item.display_name ?? item.name ?? item.lora
+          if (typeof name !== 'string' || !name.trim()) continue
+          loras.push({ name: name.trim(), strength: toNumber(item.weight ?? item.strength) })
         }
-      } catch { /* not JSON, ignore */ }
+      }
+    }
+
+    // ── <lora:名称:权重> 标签：LoraManager 的 text 字段只能靠这一手认出来 ──
+    for (const value of Object.values(inp)) {
+      if (typeof value === 'string' && value.includes('<lora:')) {
+        loras.push(...extractLoraTags(value))
+      }
     }
   }
 
-  // Merge prompts
-  let positive: string | null = null
-  let negative: string | null = null
-  if (positiveParts.length > 0) positive = positiveParts.join(', ').replace(/,\s*,/g, ',')
-  if (negativeParts.length > 0) negative = negativeParts.join(', ').replace(/,\s*,/g, ',')
+  // Merge prompts：优先用连线回溯的结果，兜底才用按字段名猜的
+  const positiveTexts = positiveFromGraph.length > 0 ? positiveFromGraph : positiveParts
+  const negativeTexts = negativeFromGraph.length > 0 ? negativeFromGraph : negativeParts
 
-  modelName = modelNames.length > 0 ? modelNames.join(' + ') : null
+  const joinTexts = (parts: string[]): string | null =>
+    parts.length > 0 ? [...new Set(parts)].join(', ').replace(/,\s*,/g, ',') : null
+
+  const positive = joinTexts(positiveTexts)
+  const negative = joinTexts(negativeTexts)
+
+  modelName = modelNames.length > 0 ? [...new Set(modelNames)].join(' + ') : null
+
+  // LoRA 去重：结构化字段和 <lora:...> 标签常描述同一批 LoRA
+  const loraMap = new Map<string, LoraInfo>()
+  for (const lora of loras) {
+    if (!loraMap.has(lora.name)) loraMap.set(lora.name, lora)
+  }
 
   return {
     source: 'ComfyUI',
@@ -326,7 +522,7 @@ function parseComfyUIPrompt(prompt: Record<string, any>): AiGenerationInfo {
     model_hash: null,
     vae_name: vaeName,
     clip_name: clipName,
-    loras,
+    loras: [...loraMap.values()],
     denoise,
     batch_size: batchSize,
     raw_params: null
@@ -417,12 +613,21 @@ function parseSdParameters(text: string): AiGenerationInfo {
   // VAE
   vaeName = paramMap['vae'] ?? paramMap['vae hash'] ?? null
 
-  // LoRA: "Add Details: 0.5"
+  // LoRA: "Add Details: 0.5" 这种键值对写法
   for (const [key, value] of Object.entries(paramMap)) {
-    if (key.startsWith('lora') || key.includes('lora')) {
-      const strength = parseFloat(value)
-      loras.push({ name: key, strength: isNaN(strength) ? null : strength })
+    if (!key.includes('lora')) continue
+
+    // `Lora hashes: "名称: 哈希, 名称: 哈希"` 是哈希清单，不是带权重的 LoRA 条目。
+    // 之前会把整串当成一个名叫 "lora hashes" 的 LoRA 塞进表格（强度还是 null）
+    if (key.includes('hash')) {
+      for (const pair of value.matchAll(/([^,"]+?):\s*([0-9a-f]{6,})/gi)) {
+        loras.push({ name: pair[1].trim(), strength: null })
+      }
+      continue
     }
+
+    const strength = parseFloat(value)
+    loras.push({ name: key, strength: isNaN(strength) ? null : strength })
   }
   // Also check "AddNet Module" style
   if (paramMap['addnet module 1']) {
@@ -731,10 +936,5 @@ function extractPngTextChunks(bytes: Buffer): PngChunkData | null {
 }
 
 function tryParseJson(text: string): boolean {
-  try {
-    JSON.parse(text)
-    return true
-  } catch {
-    return false
-  }
+  return isLooseJson(text)
 }

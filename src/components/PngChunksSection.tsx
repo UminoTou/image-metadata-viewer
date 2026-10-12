@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { PngChunkData, TextChunk, ZtxtChunk, ITextChunk } from '../types/metadata'
+import { parseLooseJson } from '../utils/loose-json'
 
 interface PngChunksSectionProps {
   chunks: PngChunkData
@@ -60,10 +61,9 @@ function JsonTreeView({ data }: { data: unknown }): JSX.Element {
 function ChunkRow({ keyword, text, isJson }: { keyword: string; text: string; isJson: boolean }): JSX.Element {
 
   if (isJson) {
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(text)
-    } catch {
+    // 用宽松解析：ComfyUI 的 prompt 块里可能出现 NaN / Infinity 这类非标准字面量
+    const parsed = parseLooseJson(text)
+    if (parsed === null) {
       return <pre className="chunk-text">{text}</pre>
     }
     return (
@@ -134,9 +134,9 @@ function PngChunksSection({ chunks }: PngChunksSectionProps): JSX.Element {
           <div key={i} className="chunk-row">
             <div className="chunk-keyword">{chunk.keyword}</div>
             {chunk.language_tag && <span className="chunk-meta">语言: {chunk.language_tag}</span>}
-            {chunk.is_json ? (
+            {chunk.is_json && parseLooseJson(chunk.text) !== null ? (
               <div className="chunk-json">
-                <JsonTreeView data={JSON.parse(chunk.text)} />
+                <JsonTreeView data={parseLooseJson(chunk.text)} />
               </div>
             ) : (
               <pre className="chunk-text">{chunk.text.length > 1000 ? chunk.text.substring(0, 1000) + '\n... (truncated)' : chunk.text}</pre>
